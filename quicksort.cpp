@@ -7,7 +7,8 @@ template <typename T>
 
 void quick_sort(T* start, T* end)
 {
-    T temp = 0,*i = start - 1, *j = start;
+    T *i = start - 1, *j = start;
+    // T temp = 0;
 
     if(start == end || start>end)
     {
@@ -17,11 +18,11 @@ void quick_sort(T* start, T* end)
     {
         if(*end < *start)
         {
-            temp = *end;
-            *end = *start;
-            *start = temp;
+            // temp = *end;
+            // *end = *start;
+            // *start = temp;
+            std::swap(*end,*start);
         }
-        
         return;
     }
 
@@ -30,18 +31,19 @@ void quick_sort(T* start, T* end)
         if(*j <= *end)
         {
             i++;
-            
-            temp = *i;
-            *i = *j;
-            *j = temp;
+            // temp = *i;
+            // *i = *j;
+            // *j = temp;
+            std::swap(*i,*j);
         }
         j++;
     }
     i++;
 
-    temp = *i;
-    *i = *end;
-    *end = temp;
+    // temp = *i;
+    // *i = *end;
+    // *end = temp;
+    std::swap(*i,*end);
     
     quick_sort(start, i-1);
     quick_sort(i+1,end);

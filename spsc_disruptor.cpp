@@ -21,7 +21,7 @@ template<typename T>
 struct slot
 {
     T data=0;
-    atomic<uint64_t> seq=0;
+    atomic<uint64_t> seq{0};
 };
 
 template<typename T, int ring_size>
