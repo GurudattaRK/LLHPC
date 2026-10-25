@@ -5,6 +5,7 @@
 #include <cstdint>     // uint16_t, uint32_t     — fixed-width integer types
 #include <random>      // mt19937, uniform_int_distribution — random number generation
 #include <chrono>      // std::chrono::milliseconds — for sleep durations
+#include <cstddef>     // std::byte
 
 #if defined(__x86_64__)
     #include <immintrin.h>
@@ -17,16 +18,28 @@
 
 using namespace std;
 
+// Padded to exactly one cache line so adjacent slots never false-share:
+// without this, slot<uint16_t> is 16 bytes and four slots pack into one
+// 64-byte line, so the producer writing slot[i] and the consumer reading
+// slot[i+1..i+3] bounce the same cache line back and forth between cores.
+// `seq` (8-byte aligned) is placed first so no implicit padding sneaks in
+// before it - otherwise alignas(64) would round the whole struct up to 128.
 template<typename T>
-struct slot
+struct alignas(64) slot
 {
-    T data=0;
+    static_assert(sizeof(T) <= 64 - sizeof(atomic<uint64_t>),
+                  "T too large to fit a one-cache-line slot");
     atomic<uint64_t> seq{0};
+    T data{};
+    char _pad[64 - sizeof(atomic<uint64_t>) - sizeof(T)];
 };
 
 template<typename T, int ring_size>
 class ring_queue
 {
+    static_assert(ring_size > 0 && (ring_size & (ring_size - 1)) == 0,
+                  "ring_size must be a power of two (index is counter & (ring_size-1))");
+
     slot<T> ring[ring_size];
 
     public:
@@ -36,42 +49,48 @@ class ring_queue
             for (int i = 0; i < ring_size; i++)
                 ring[i].seq.store(i, memory_order_relaxed);  // slot i starts at sequence i
         }
-    
-        bool read(T* output, uint64_t counter)
+
+        // Blocking: spins until the slot is readable. Single-producer/single-
+        // consumer only, so this can never fail - hence void, not bool.
+        void read(T* output, uint64_t counter)
         {
-            int idx = counter & (ring_size-1);
-            while(1)
-            {
-                if(ring[idx].seq.load(memory_order_acquire) == counter + 1)
-                {
-                    *output = ring[idx].data;
-                    ring[idx].seq.store(counter + ring_size, memory_order_release);
-                    return true;
-                }
-                else
-                {
-                    SPIN_WAIT();
-                }
-            }
+            while(!try_read(output, counter))
+                SPIN_WAIT();
         }
 
-        bool write(T* value, uint64_t counter)
+        void write(T* value, uint64_t counter)
+        {
+            while(!try_write(value, counter))
+                SPIN_WAIT();
+        }
+
+        // Non-blocking single-shot check. Returns false immediately if the
+        // slot isn't ready yet instead of spinning - use this when the caller
+        // wants to do other work rather than block.
+        bool try_read(T* output, uint64_t counter)
         {
             int idx = counter & (ring_size-1);
-            while(1)
-            {
-                if(ring[idx].seq.load(memory_order_acquire) == counter)
-                {
-                    ring[idx].data = *value;
-                    //atomic_thread_fence(memory_order_release); // uncomment to maybe enable MPMC support
-                    ring[idx].seq.store(counter +1, memory_order_release);
-                    return true;
-                }
-                else
-                {
-                    SPIN_WAIT();
-                }
-            }
+            if (ring[idx].seq.load(memory_order_acquire) != counter + 1)
+                return false;
+            *output = ring[idx].data;
+            ring[idx].seq.store(counter + ring_size, memory_order_release);
+            return true;
+        }
+
+        bool try_write(T* value, uint64_t counter)
+        {
+            int idx = counter & (ring_size-1);
+            if (ring[idx].seq.load(memory_order_acquire) != counter)
+                return false;
+            ring[idx].data = *value;
+            // NOTE: this is SPSC only. A single producer owns `counter`
+            // (nothing else increments it), so no CAS is needed here. Making
+            // this MPMC is NOT just "add a fence" - multiple producers would
+            // race on the same idx/counter, so you'd need an atomic
+            // fetch_add on a shared write cursor plus a CAS on seq, same
+            // shape as the classic Vyukov MPMC queue.
+            ring[idx].seq.store(counter + 1, memory_order_release);
+            return true;
         }
 };
 
@@ -83,13 +102,11 @@ const int number_of_slots = 8;
 ring_queue<uint16_t, number_of_slots> spsc_queue;
 
 
-//TEST ==============
-uint16_t input[TOTAL_ITEMS] ={0};
-uint32_t output[TOTAL_ITEMS]={0};
-int global_input_idx =0;
-int global_output_idx =0;
-// ==================
-
+// Values the producer sent / the consumer computed, indexed by item number
+// (not by ring slot) so the correctness check below is independent of
+// whatever wraparound happened inside the ring.
+uint16_t input[TOTAL_ITEMS]  = {0};
+uint32_t output[TOTAL_ITEMS] = {0};
 
 void producer()
 {
@@ -105,25 +122,19 @@ void producer()
     for (int i = 0; i < TOTAL_ITEMS; ++i)
     {
         uint16_t value = dist(rng);   // generate one random 16-bit int
+        input[i] = value;             // record for the post-run correctness check
         uint16_t * val_ptr = &value;
 
-        // Spin until the queue accepts the item.
-        // enqueue() returns false when the ring buffer is full.
-        spsc_queue.write(val_ptr,counter);
-        
-        // Yield the CPU briefly so the consumer gets a chance to drain
+        // Blocks until the ring accepts the item (SPSC - can't fail).
+        spsc_queue.write(val_ptr, counter);
+
+        // Simulated producer-side work between items. No I/O in this loop -
+        // logging happens after both threads finish, not per iteration.
         std::this_thread::sleep_for(std::chrono::microseconds(wait_time));
         counter++;
-        
-        
-        // input[global_input_idx] = value;
-        // global_input_idx++;
-        
-        // Optional: uncomment to see what the producer is sending
-        std::cout << "[producer]  counter  at: " <<counter << "\n";
     }
 
-    std::cout << "[producer] finished — enqueueed " << TOTAL_ITEMS << " items\n";
+    std::cout << "[producer] finished — enqueued " << TOTAL_ITEMS << " items\n";
 }
 
 
@@ -132,38 +143,28 @@ void producer()
 // ============================================================
 void consumer()
 {
-    int received = 0;   // count how many items we have processed
-
     uint64_t counter = 0;
 
-    // Keep running until we've received every item the producer will send.
-    while (received < TOTAL_ITEMS)   
+    for (int received = 0; received < TOTAL_ITEMS; ++received)
     {
-        uint16_t value;   // dequeue() will fill this in if an item is available
-        uint16_t* val_ptr = &value;
+        uint16_t value;
+        spsc_queue.read(&value, counter);   // blocks until an item is ready (SPSC - can't fail)
+        counter++;
 
-        if (spsc_queue.read(val_ptr,counter))       
-        {
-            uint32_t square = static_cast<uint32_t>(value) * static_cast<uint32_t>(value);
-            counter++;
-            std::cout << "[consumer]   counter:   "<<counter<< "\n";
-            
-            // output[global_output_idx] = square;
-            // global_output_idx++;
-            ++received;
-            // Queue is empty but producer is still running — back off
-            std::this_thread::sleep_for(std::chrono::microseconds(wait_time));
-        }
+        output[received] = static_cast<uint32_t>(value) * static_cast<uint32_t>(value);
+
+        // Simulated consumer-side work between items, no I/O in the loop.
+        std::this_thread::sleep_for(std::chrono::microseconds(wait_time));
     }
 
-    std::cout << "[consumer] finished — processed " << received << " items\n";
+    std::cout << "[consumer] finished — processed " << TOTAL_ITEMS << " items\n";
 }
 
 int main()
 {
     std::cout << "SPSC Queue test — "
               << TOTAL_ITEMS << " uint16_t values\n"
-              << "Queue capacity: " << 16 << " slot\n\n";
+              << "Queue capacity: " << number_of_slots << " slots\n\n";
 
     // Spawn the consumer FIRST so it is already waiting when the
     // producer starts enqueueing (avoids a tiny initial full-queue stall).
@@ -174,20 +175,20 @@ int main()
     consumer_thread.join();
 
     std::cout << "\nAll done.\n";
-//TEST ============================
-/*     bool flag = true;
-    for (int i = 0; i < TOTAL_ITEMS; i++) 
+
+    bool flag = true;
+    for (int i = 0; i < TOTAL_ITEMS; i++)
     {
         uint32_t expected = static_cast<uint32_t>(input[i]) * static_cast<uint32_t>(input[i]);
-        if (output[i] != expected) 
+        if (output[i] != expected)
         {
             flag = false;
-            break;
+            std::cout << "[FAIL] item " << i << ": expected " << expected
+                      << ", got " << output[i] << "\n";
         }
     }
-    if(flag)
-        cout<<"test passed, all values are correct"<< endl;
-*/
-//=====================================
-    return 0;
+    if (flag)
+        cout << "test passed, all values are correct" << endl;
+
+    return flag ? 0 : 1;
 }
